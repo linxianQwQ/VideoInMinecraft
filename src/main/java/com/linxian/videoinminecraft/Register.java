@@ -1,6 +1,5 @@
 package com.linxian.videoinminecraft;
 
-import com.linxian.videoinminecraft.video.blockentity.VideoBlockEntity;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.world.level.block.entity.BlockEntityType;
@@ -19,10 +18,5 @@ public class Register {
     public static KeyMapping stopKey;
     public static final DeferredRegister<BlockEntityType<?>> BLOCK_ENTITY_TYPES =
             DeferredRegister.create(Registries.BLOCK_ENTITY_TYPE, VideoInMinecraft.MOD_ID);
-    public static final Supplier<BlockEntityType<VideoBlockEntity>> MY_BLOCK_ENTITY =
-            BLOCK_ENTITY_TYPES.register(
-                    "my_block_entity",
-                    () -> new VideoBlockEntity();
-            );
 
 }

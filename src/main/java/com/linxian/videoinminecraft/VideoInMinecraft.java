@@ -22,7 +22,4 @@ public class VideoInMinecraft {
         modEventBus.register(clientRegister);
     }
 
-    public VideoInMinecraft() {
-
-    }
 }

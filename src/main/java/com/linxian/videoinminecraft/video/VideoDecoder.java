@@ -67,9 +67,6 @@ public class VideoDecoder {
 
         ACTIVE_VIDEO_DECODER.incrementAndGet();
         LIVE_DECODERS.put(videoDecoder, Boolean.TRUE);
-        VideoInMinecraft.LOGGER.debug("init");
-        videoDecoder.State_INIT();
-        videoDecoder.InitDecoder();
         return result;
     }
 
@@ -88,15 +85,13 @@ public class VideoDecoder {
     }
 
     public enum State {
-        CREATED,
-        INITIALIZING,
         READY,
         PLAYING,
         PAUSE,
         DESTROYED
     }
 
-    private volatile State current = State.CREATED;
+    private volatile State current = State.READY;
 
     public State get() { return current; }
     public boolean isDestroyed() { return current == State.DESTROYED; }
@@ -107,15 +102,14 @@ public class VideoDecoder {
         return current == State.READY || current == State.PLAYING || current == State.PAUSE;
     }
 
-    private synchronized void State_INIT() { if (current == State.CREATED) current = State.INITIALIZING; }
-    private synchronized void State_READY() { if (current == State.INITIALIZING || current == State.PLAYING) current = State.READY; }
+    private synchronized void State_READY() { if (current == State.PLAYING) current = State.READY; }
     private synchronized void State_PLAYING() { if (current == State.READY || current == State.PAUSE) current = State.PLAYING; }
     private synchronized void State_PAUSE() { if (current == State.PLAYING) current = State.PAUSE; }
     private synchronized void State_DESTORY() { current = State.DESTROYED; }
 
     private final Path VIDEO_PATH;
     private final FFmpegFrameGrabber grabber;
-    private ExecutorService grabExecutor;
+    private ExecutorService grabExecutor;      // 单线程驱动循环（交替推进视频+音频）
 
     /** 携带视频元信息。 */
     public static class VideoMeta {
@@ -145,48 +139,50 @@ public class VideoDecoder {
         this.grabber = grabber;
         this.grabExecutor = Executors.newSingleThreadExecutor();
     }
-
-    private void InitDecoder() {
-        this.grabExecutor.submit(() -> {
-            this.State_INIT();
-            // 构造时已解码元信息（width/height/fps 已就绪），直接进入 READY
-            this.State_READY();
-        });
-    }
-
     public synchronized void destroy() {
         this.State_DESTORY();
         LIVE_DECODERS.remove(this);
-        this.grabExecutor.submit(() -> this.grabber.close());
+        if (this.grabber != null) this.grabber.close();
         this.grabExecutor.shutdownNow();
         ACTIVE_VIDEO_DECODER.decrementAndGet();
     }
 
-    private long playStartSystemNano;
+    public long playStartSystemNano;
     private long currentTimeUs;
 
-    /** 启动解码线程：持续从 FFmpeg 解码并 publish 到管道池就绪队列（背压自动限流）。 */
+    /** 启动单线程驱动循环：交替推进视频与音频解码（非阻塞单次），满槽/暂停时 sleep 让出。 */
     public synchronized void PlayVideo() {
         if (this.isReady()) {
+            playStartSystemNano = System.nanoTime();
             this.grabExecutor.submit(() -> {
-                playStartSystemNano = System.nanoTime();
                 while (!isDestroyed()) {
                     if (isPause()) {
-                        try {
-                            Thread.sleep(30L);
-                        } catch (InterruptedException e) {
-                            break;
-                        }
+                        try { Thread.sleep(30L); } catch (InterruptedException e) { break; }
                         continue;
                     }
                     try {
-                        // 借槽 → sws_scale 直写 → publish（内部阻塞式背压），返回即一帧就绪
-                        var slot = this.grabber.grabImage();
-                        if (slot == null) { // EOF
-                            Pause();
-                            break;
+                        boolean videoDone = this.grabber.isVideoEof();
+                        boolean audioDone = !this.grabber.hasAudio() || this.grabber.isAudioEof();
+                        if (videoDone && audioDone) break; // 双流结束
+
+                        boolean didWork = false;
+                        // 视频推进一步（非阻塞；readyQueue 满/EOF 时立即返回）
+                        if (!videoDone) {
+                            var slot = this.grabber.grabImage();
+                            if (slot != null) {
+                                didWork = true;
+                                currentTimeUs = this.grabber.getLastVideoTimestampUs();
+                            }
                         }
-                        currentTimeUs = this.grabber.getLastTimestampUs();
+                        // 音频推进一步（非阻塞；audioReadyQueue 满/无包/EOF 时立即返回）
+                        if (this.grabber.hasAudio() && !audioDone) {
+                            var slot = this.grabber.grabAudio();
+                            if (slot != null) didWork = true;
+                        }
+                        if (!didWork) {
+                            // 本次无产出（队列满/需等待投递包）：短暂让出，等消费者释放槽
+                            Thread.sleep(1L);
+                        }
                     } catch (Exception e) {
                         VideoInMinecraft.LOGGER.warn("decode frame error", e);
                         break;

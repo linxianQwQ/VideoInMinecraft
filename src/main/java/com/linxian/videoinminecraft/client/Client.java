@@ -26,6 +26,8 @@ public class Client {
     private boolean ACTIVE = false;
     public VideoDecoder videoDecoder;
     public VideoScreen videoScreen;
+    /** OpenAL 上下文是否已就绪（SoundEngineLoadEvent 置位）。 */
+    public boolean soundEngineReady = false;
     public static VideoDecoder create(String name){
         VideoInMinecraft.LOGGER.debug("2");
         VideoDecoder.CreateDecoderResult result = VideoDecoder.createVideoDecode(name);
@@ -55,7 +57,13 @@ public class Client {
                     VideoInMinecraft.LOGGER.debug("ready");
                     VideoInMinecraft.LOGGER.debug("back to main thread");
                     Minecraft.getInstance().tell(() -> {
-                        VideoInMinecraft.client.videoScreen = new VideoScreen(videoDecoder);
+                        VideoScreen screen = new VideoScreen(videoDecoder);
+                        VideoInMinecraft.client.videoScreen = screen;
+                        // 双向兜底：SoundEngineLoadEvent 可能早于 VideoScreen 创建；
+                        // 若已就绪（事件先触发过），创建后立即补初始化 OpenAL 资源
+                        if (VideoInMinecraft.client.soundEngineReady) {
+                            screen.onSoundEngineReady();
+                        }
                         VideoInMinecraft.LOGGER.debug("task created");
                         // 进入世界后自动开始播放（L 键仍然可用）
                         if (Minecraft.getInstance().player != null) {
@@ -81,6 +89,10 @@ public class Client {
             VideoInMinecraft.LOGGER.info("Stopping video playback and freeing decoders...");
             VideoDecoder.StopAll();
             this.videoDecoder = null;
+        }
+        // 先释放 OpenAL 等消费端资源，再置空引用
+        if (this.videoScreen != null) {
+            this.videoScreen.dispose();
             this.videoScreen = null;
         }
     }
@@ -95,12 +107,14 @@ public class Client {
             VideoInMinecraft.LOGGER.debug("L");
             VideoInMinecraft.LOGGER.debug(String.valueOf(ACTIVE));
             ACTIVE = true;
+            videoDecoder.PlayVideo();
             VideoInMinecraft.LOGGER.debug(String.valueOf(ACTIVE));
         }
         if (stopKey.consumeClick()) {
             VideoInMinecraft.LOGGER.debug(String.valueOf(ACTIVE));
             VideoInMinecraft.LOGGER.debug("I");
             ACTIVE = false;
+            if (videoScreen != null) videoScreen.dispose();
             VideoInMinecraft.LOGGER.debug(String.valueOf(ACTIVE));
         }
     }
@@ -109,12 +123,19 @@ public class Client {
         // 客户端退出：停止并释放所有解码器（FFmpeg 上下文 + 管道池对齐内存 + 线程）
         VideoInMinecraft.LOGGER.info("Client shutting down, cleaning up video decoders...");
         VideoDecoder.StopAll();
+        if (videoScreen != null) {
+            videoScreen.dispose();
+            videoScreen = null;
+        }
+        videoDecoder = null;
+        ACTIVE = false;
     }
 
     /** 退出到主界面：停止播放并销毁解码器（FFmpeg 上下文/管道池/线程）。 */
     @SubscribeEvent
     public void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
         VideoInMinecraft.LOGGER.info("Logging out to main menu, freeing video decoders...");
+        // stopVideoPlayback 内部已统一处理 videoScreen.dispose()
         stopVideoPlayback();
     }
 
@@ -128,7 +149,6 @@ public class Client {
     @SubscribeEvent
     public void onRender(RenderGuiEvent.Pre event){
         if (!ACTIVE) return;
-        videoDecoder.PlayVideo();
         videoScreen.updateVideoTexture();
 
         Minecraft mc = Minecraft.getInstance();

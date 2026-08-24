@@ -50,8 +50,8 @@ Example mod description.
 '''
 
 # The [[mixins]] blockentity allows you to declare your mixin config to FML so that it gets loaded.
-#[[mixins]]
-#config="${mod_id}.mixins.json"
+[[mixins]]
+config="videoinminecraft.mixins.json"
 
 # The [[accessTransformers]] blockentity allows you to declare where your AT file is.
 # If this blockentity is omitted, a fallback attempt will be made to load an AT from META-INF/accesstransformer.cfg

@@ -118,25 +118,17 @@ configurations {
 }
 
 dependencies {
-    jarJar('org.bytedeco:ffmpeg:7.1-1.5.11')
-    jarJar('org.bytedeco:ffmpeg:7.1-1.5.11:windows-x86_64')
-    jarJar('org.bytedeco:javacpp:1.5.11')
-    jarJar('org.bytedeco:javacv:1.5.11')
-    implementation 'org.bytedeco:javacv:1.5.11'
-    implementation 'org.bytedeco:ffmpeg:7.1-1.5.11'
-    implementation'org.bytedeco:ffmpeg:7.1-1.5.11:windows-x86_64'
-    implementation 'org.bytedeco:javacpp:1.5.11'
+    jarJar('org.bytedeco:ffmpeg:8.0.1-1.5.13')
+    jarJar('org.bytedeco:ffmpeg:8.0.1-1.5.13:windows-x86_64')
+    jarJar('org.bytedeco:javacpp:1.5.13')
+    implementation 'org.bytedeco:ffmpeg:8.0.1-1.5.13'
+    implementation'org.bytedeco:ffmpeg:8.0.1-1.5.13:windows-x86_64'
+    implementation 'org.bytedeco:javacpp:1.5.13'
 
 
-    additionalRuntimeClasspath 'org.bytedeco:javacpp:1.5.11'
-    additionalRuntimeClasspath 'org.bytedeco:ffmpeg:7.1-1.5.11'
-    additionalRuntimeClasspath'org.bytedeco:ffmpeg:7.1-1.5.11:windows-x86_64'
-    additionalRuntimeClasspath 'org.bytedeco:javacv:1.5.11'
-    runtimeOnly 'org.openjfx:javafx-graphics:21.0.6:win'
-    runtimeOnly 'org.openjfx:javafx-base:21.0.6:win'
-
-    additionalRuntimeClasspath 'org.openjfx:javafx-graphics:21.0.6:win'
-    additionalRuntimeClasspath 'org.openjfx:javafx-base:21.0.6:win'
+    additionalRuntimeClasspath 'org.bytedeco:javacpp:1.5.13'
+    additionalRuntimeClasspath 'org.bytedeco:ffmpeg:8.0.1-1.5.13'
+    additionalRuntimeClasspath'org.bytedeco:ffmpeg:8.0.1-1.5.13:windows-x86_64'
     // Example optional mod dependency with JEI
     // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
     // compileOnly "mezz.jei:jei-${mc_version}-common-api:${jei_version}"

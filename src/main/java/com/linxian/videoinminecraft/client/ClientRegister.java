@@ -23,7 +23,6 @@ public class ClientRegister {
     }
     @SubscribeEvent
     public void onStarted(FMLClientSetupEvent event){
-        VideoInMinecraft.LOGGER.debug("1");
         // 客户端启动：创建视频播放器（解码器 → 等 ready → 主线程建 VideoScreen）
         VideoInMinecraft.client.startVideoPlayback();
     }

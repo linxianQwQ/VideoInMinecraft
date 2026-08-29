@@ -161,26 +161,13 @@ public class VideoDecoder {
                         continue;
                     }
                     try {
-                        boolean videoDone = this.grabber.isVideoEof();
-                        boolean audioDone = !this.grabber.hasAudio() || this.grabber.isAudioEof();
-                        if (videoDone && audioDone) break; // 双流结束
+                        if (this.grabber.isFinished()) break; // 双流结束
 
-                        boolean didWork = false;
-                        // 视频推进一步（非阻塞；readyQueue 满/EOF 时立即返回）
-                        if (!videoDone) {
-                            var slot = this.grabber.grabImage();
-                            if (slot != null) {
-                                didWork = true;
-                                currentTimeUs = this.grabber.getLastVideoTimestampUs();
-                            }
-                        }
-                        // 音频推进一步（非阻塞；audioReadyQueue 满/无包/EOF 时立即返回）
-                        if (this.grabber.hasAudio() && !audioDone) {
-                            var slot = this.grabber.grabAudio();
-                            if (slot != null) didWork = true;
-                        }
-                        if (!didWork) {
-                            // 本次无产出（队列满/需等待投递包）：短暂让出，等消费者释放槽
+                        // 对称推进一次：视频一步 + 音频一步（非阻塞）
+                        boolean advanced = this.grabber.grab();
+                        currentTimeUs = this.grabber.getLastVideoTimestampUs();
+                        if (!advanced) {
+                            // 本次无推进（队列满 / EAGAIN 待喂包 / EOF 等待 flush 排空）：短暂让出
                             Thread.sleep(1L);
                         }
                     } catch (Exception e) {

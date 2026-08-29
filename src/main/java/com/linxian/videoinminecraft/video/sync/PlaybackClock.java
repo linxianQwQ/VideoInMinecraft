@@ -1,74 +1,84 @@
 package com.linxian.videoinminecraft.video.sync;
 
-import java.util.function.LongSupplier;
-
 /**
- * 播放时钟：负责"现在该播到哪个时间点"。
+ * 播放时钟：以音频为主时钟，视频按 PTS 对齐。
  *
- * <p>设计：音频是连续流，播放位置精确 —— 以音频时钟为主设备；
- * 无音频（或音频未启动）时回退系统时钟 + 首帧 PTS 校准。
+ * <p>锚点放在 <b>Channel.play()（OpenAL 真正开始播放）</b> 时刻，而非首次 read：
+ * MC 在 attachBufferStream 阶段会 pumpBuffers(4) 预缓存 4 个 buffer（尚未播放），
+ * 若以首次 read 锚定会因主线程调度延迟导致提前几十毫秒，音画偏移。
  *
- * <p>对外只提供两个核心问题：
- * <ul>
- *   <li>{@link #nowUs()}：当前播放位置（微秒）</li>
- *   <li>{@link #shouldRender(long)}：给定帧 PTS，是否应该现在上屏（早则不显示、到点/已过则显示）</li>
- * </ul>
+ * <p>播放位置 = 首音频帧 PTS（归一化≈0）+ play 时刻后的真实流逝时间 <b>减去暂停时长</b>。
+ *
+ * <p>暂停感知：音频为主时钟，音频暂停（Channel.pause()）即播放暂停，暂停期间
+ * wall-clock 继续走但媒体不前进，故必须把暂停时段从流逝中扣除，否则恢复后
+ * nowUs 远超视频帧 PTS 导致疯狂快进追赶（deltaUs 大负数）。
+ *
+ * <p>无音轨 / 音频尚未 play 时不门控（直接上屏），避免 pre-roll 黑屏。
  */
 public class PlaybackClock {
 
-    /** 音频时钟提供者：返回 OpenAL 已播放的音频位置（微秒）。null 表示无音频主时钟。 */
-    private LongSupplier audioClockProvider;
-    private boolean hasAudioClock = false;
+    /** 音轨是否存在；无音轨则时钟永不启用。 */
+    private final boolean hasAudio;
 
-    // 系统时钟回退相关的校准
-    private long sysStartNano = -1;
-    private long firstPtsUs = -1;
+    /** 音频主时钟锚点：play 时刻的媒体 PTS（微秒）与墙钟（纳秒）。 */
+    private volatile long audioStartPtsUs = -1;
+    private volatile long audioStartNano = -1;
 
-    /** 设置/更新音频主时钟。 */
-    public void setAudioClockProvider(LongSupplier provider) {
-        if (provider != null) {
-            this.audioClockProvider = provider;
-            this.hasAudioClock = true;
-        } else {
-            this.audioClockProvider = null;
-            this.hasAudioClock = false;
-        }
-    }
+    /** 暂停累计总时长（纳秒），从流逝时间中扣除。 */
+    private final java.util.concurrent.atomic.AtomicLong pauseOffsetNano =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** 当前暂停起始墙钟（纳秒）；-1 表示未在暂停。 */
+    private volatile long pauseStartNano = -1;
 
-    /** 以某个视频帧的 PTS 初始化系统时钟基线（首个视频帧到达时调用）。 */
-    public void initSystemClock(long firstFramePtsUs) {
-        if (sysStartNano == -1) {
-            this.sysStartNano = System.nanoTime();
-            this.firstPtsUs = firstFramePtsUs;
-        }
-    }
+    /** 允许视频帧早于音频主时钟仍上屏的容差（微秒）：吸收上传抖动，20ms ≈ 半帧(25fps)。 */
+    private static final long EARLY_TOLERANCE_US = 20_000L;
 
-    /** 当前播放位置（微秒）：优先音频主时钟，否则系统时钟+首帧校准。 */
-    public long nowUs() {
-        if (hasAudioClock && audioClockProvider != null) {
-            return audioClockProvider.getAsLong();
-        }
-        // 系统时钟回退：从第一帧起按真实流逝推进
-        if (sysStartNano == -1) return 0;
-        long elapsedUs = (System.nanoTime() - sysStartNano) / 1000L;
-        return firstPtsUs + elapsedUs;
+    public PlaybackClock(boolean hasAudio) {
+        this.hasAudio = hasAudio;
     }
 
     /**
-     * 判断一帧是否该上屏。
-     * <ul>
-     *   <li>帧 PTS 还远早于当前时钟（早于 nowUs - EARLY_TOLERANCE）→ 不该显示（丢弃/留待更近帧）</li>
-     *   <li>否则已到点或仅早一点点 → 该显示</li>
-     * </ul>
-     * @param framePtsUs 帧的 PTS（微秒）
+     * 音频主时钟锚定：OpenAL 真正开始播放（Channel.play()）时调用。
+     * firstPtsUs = 首个进入队列的音频帧 PTS（归一化到 0 起点）。
+     * 幂等：只以第一次为准，避免重复 play 重置。
      */
-    public boolean shouldRender(long framePtsUs) {
-        if (hasAudioClock && audioClockProvider != null) {
-            return framePtsUs <= nowUs() + EARLY_TOLERANCE_US;
+    public void onAudioPlayStart(long firstPtsUs) {
+        if (audioStartNano == -1) {
+            audioStartPtsUs = firstPtsUs;
+            audioStartNano = System.nanoTime();
         }
-        return framePtsUs <= nowUs() + EARLY_TOLERANCE_US;
     }
 
-    /** 提前显示容差：避免 GL 上传比音频早出现微小的撕裂感（2ms 内都算准时）。 */
-    private static final long EARLY_TOLERANCE_US = 2000L;
+    /** 音频暂停（Channel.pause()）：冻结时钟。幂等。 */
+    public void pause() {
+        if (pauseStartNano == -1) {
+            pauseStartNano = System.nanoTime();
+        }
+    }
+
+    /** 音频恢复（Channel.unpause()）：把暂停时段计入 offset，继续推进。幂等。 */
+    public void resume() {
+        if (pauseStartNano != -1) {
+            long pausedNano = System.nanoTime() - pauseStartNano;
+            pauseOffsetNano.addAndGet(pausedNano);
+            pauseStartNano = -1;
+        }
+    }
+
+    /** 当前媒体播放位置（微秒）：播放总时长扣除全部暂停时段。 */
+    public long nowUs() {
+        if (audioStartNano == -1) return 0;
+        long nowNano = System.nanoTime();
+        long elapsedNano = nowNano - audioStartNano - pauseOffsetNano.get();
+        if (pauseStartNano != -1) {
+            elapsedNano -= (nowNano - pauseStartNano);   // 正在暂停中：暂停段也不计
+        }
+        return audioStartPtsUs + elapsedNano / 1000L;
+    }
+
+    /** 该帧是否该上屏：无音轨 / 音频尚未播放 → 恒 true；否则按 PTS 与主时钟对齐。 */
+    public boolean shouldRender(long framePtsUs) {
+        if (!hasAudio || audioStartNano == -1) return true;
+        return framePtsUs <= nowUs() + EARLY_TOLERANCE_US;
+    }
 }

@@ -3,7 +3,8 @@
   "package": "com.linxian.videoinminecraft.video.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "SoundEngineMixin"
+    "SoundEngineMixin",
+    "ChannelMixin"
   ],
   "injectors": {
     "defaultRequire": 1

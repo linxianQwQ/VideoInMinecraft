@@ -1,4 +1,4 @@
-package com.linxian.videoinminecraft.video.consumer;
+package com.linxian.videoinminecraft.video.play;
 
 import com.linxian.videoinminecraft.video.sync.PlaybackClock;
 import com.linxian.videoinminecraft.video.tool.FrameBufferPoolWithQueue;
@@ -7,7 +7,7 @@ import org.lwjgl.opengl.GL30;
 
 /**
  * 视频消费者：渲染线程每帧调用一次。
- * 取最新视频帧：PTS 已到点 → GL 直传上屏；早/晚 → 丢弃（丢帧吸收延迟，绝不空转等待）。
+ * 按音频主时钟门控：到点才上屏，未到点等待（不弹出，留给后续渲染帧）。
  */
 public class VideoConsumer {
 
@@ -16,7 +16,6 @@ public class VideoConsumer {
     private final int textureId;
     private final int width;
     private final int height;
-    private boolean firstFrameDone = false;
 
     public VideoConsumer(FrameBufferPoolWithQueue pool, PlaybackClock clock, int textureId, int width, int height) {
         this.pool = pool;
@@ -26,21 +25,18 @@ public class VideoConsumer {
         this.height = height;
     }
 
-    /** 每渲染帧调用：取一帧并按时钟决定是否上屏。 */
+    /** 每渲染帧调用：按音频主时钟门控，到点才上屏，未到点等待（不弹出）。 */
     public void render() {
+        // peek 队头（非破坏）：帧还没到点就不弹出，留给后续渲染帧
+        FrameBufferPoolWithQueue.ImageBufferSlot head = pool.peekImageBuffer();
+        if (head == null) return; // 无帧：跳过本帧（解码跟不上自然降帧）
+
+        // 到点（或已过点、或音频尚未开始）→ 上屏；未来帧 → 等待音频主时钟追上
+        if (!clock.shouldRender(head.ptsUs)) return;
+
         FrameBufferPoolWithQueue.ImageBufferSlot slot = pool.tryAcquireImageBuffer();
-        if (slot == null) return; // 无帧：跳过本帧（解码跟不上自然降帧）
-
-        if (!firstFrameDone) {
-            // 首个视频帧建立系统时钟基线（音频未启动时使用）
-            clock.initSystemClock(slot.ptsUs);
-            firstFrameDone = true;
-        }
-
-        // 到点 → GL 上传；早/晚 → 丢弃（丢帧吸收延迟）。无论如何都归还槽。
-        if (clock.shouldRender(slot.ptsUs)) {
-            upload(slot);
-        }
+        if (slot == null) return;
+        upload(slot);
         pool.releaseImageBuffer(slot);
     }
 

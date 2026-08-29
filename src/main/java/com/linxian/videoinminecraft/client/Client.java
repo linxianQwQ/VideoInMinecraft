@@ -26,12 +26,12 @@ public class Client {
     private boolean ACTIVE = false;
     public VideoDecoder videoDecoder;
     public VideoScreen videoScreen;
-    /** OpenAL 上下文是否已就绪（SoundEngineLoadEvent 置位）。 */
+    /** OpenAL 上下文是否已就绪（SoundEngineMixin 在 reload TAIL 置位）。 */
     public boolean soundEngineReady = false;
+    /** MC 原版创建的 OpenAL context 句柄（SoundEngineMixin 捕获，供 AudioConsumer 强制绑定）。 */
+    public long alContext = 0;
     public static VideoDecoder create(String name){
-        VideoInMinecraft.LOGGER.debug("2");
         VideoDecoder.CreateDecoderResult result = VideoDecoder.createVideoDecode(name);
-        VideoInMinecraft.LOGGER.debug(result.resultReason().getReason());
         if(result.isSuccess()) return result.videoDecoder();
         throw new RuntimeException(result.resultReason().getReason());
     }
@@ -46,25 +46,17 @@ public class Client {
         this.videoDecoder = videoDecoder;
         // 解码构造即就绪，但保持原有异步等待语义，等待 READY 后回到主线程创建画布
         new Thread(() -> {
-            VideoInMinecraft.LOGGER.debug("wait for ready");
             while (true) {
                 // 解码器可能被 LoggingOut 销毁（DESTROYED），此时退出等待
                 if (videoDecoder.isDestroyed()) {
-                    VideoInMinecraft.LOGGER.debug("decoder destroyed while waiting, abort");
                     break;
                 }
                 if (videoDecoder.isReady()) {
-                    VideoInMinecraft.LOGGER.debug("ready");
-                    VideoInMinecraft.LOGGER.debug("back to main thread");
                     Minecraft.getInstance().tell(() -> {
                         VideoScreen screen = new VideoScreen(videoDecoder);
                         VideoInMinecraft.client.videoScreen = screen;
-                        // 双向兜底：SoundEngineLoadEvent 可能早于 VideoScreen 创建；
-                        // 若已就绪（事件先触发过），创建后立即补初始化 OpenAL 资源
-                        if (VideoInMinecraft.client.soundEngineReady) {
-                            screen.onSoundEngineReady();
-                        }
-                        VideoInMinecraft.LOGGER.debug("task created");
+                        // ★ 不再自动 startAudio：音频须等解码线程 PlayVideo 启动后（L 键）才送入，
+                        //   否则 read() 阻塞等槽会卡死 SoundEngine。
                         // 进入世界后自动开始播放（L 键仍然可用）
                         if (Minecraft.getInstance().player != null) {
                             VideoInMinecraft.client.ACTIVE = true;
@@ -104,18 +96,16 @@ public class Client {
 
         // 使用 consumeClick() 确保只触发一次
         if (startKey.consumeClick()) {
-            VideoInMinecraft.LOGGER.debug("L");
-            VideoInMinecraft.LOGGER.debug(String.valueOf(ACTIVE));
             ACTIVE = true;
             videoDecoder.PlayVideo();
-            VideoInMinecraft.LOGGER.debug(String.valueOf(ACTIVE));
+            // 送入模型：启动音频由 MC SoundEngine 拉取（须 SoundEngine 已就绪才 play 有效）
+            if (videoScreen != null && soundEngineReady) {
+                videoScreen.startAudio();
+            }
         }
         if (stopKey.consumeClick()) {
-            VideoInMinecraft.LOGGER.debug(String.valueOf(ACTIVE));
-            VideoInMinecraft.LOGGER.debug("I");
             ACTIVE = false;
             if (videoScreen != null) videoScreen.dispose();
-            VideoInMinecraft.LOGGER.debug(String.valueOf(ACTIVE));
         }
     }
     @SubscribeEvent

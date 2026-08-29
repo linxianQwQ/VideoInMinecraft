@@ -6,8 +6,23 @@ import org.bytedeco.javacpp.PointerPointer;
 import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+import static org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_AAC;
+import static org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_MP2;
+import static org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_MP3;
+import static org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_AC3;
+import static org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_DTS;
+
+import static org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_OPUS;
+import static org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_VORBIS;
+import static org.bytedeco.ffmpeg.global.avcodec.AV_CODEC_ID_FLAC;
+
+
 
 
 /**
@@ -36,11 +51,6 @@ import java.util.concurrent.LinkedBlockingQueue;
  */
 public class FrameBufferPoolWithQueue {
 
-    /** 全局池/槽序号：物理实例判别（identityHashCode 会被 GC/碰撞污染，不可靠）。 */
-    private static final java.util.concurrent.atomic.AtomicInteger POOL_SEQ = new java.util.concurrent.atomic.AtomicInteger();
-    private static final java.util.concurrent.atomic.AtomicInteger SLOT_SEQ = new java.util.concurrent.atomic.AtomicInteger();
-    public final int poolSeq;
-
     /** 常驻的可复用缓冲槽。预分配一次，全程零再分配。 */
     public static final class ImageBufferSlot {
         /** 像素缓冲视图（64 字节对齐内存的 ByteBuffer 视图）：GL 上传的像素源 */
@@ -54,11 +64,8 @@ public class FrameBufferPoolWithQueue {
         public final int capacity;
         public long ptsUs;
 
-        public final int slotSeq;   // 全局唯一槽序号（物理判别）
-
         ImageBufferSlot(int capacity) {
             this.capacity = capacity;
-            this.slotSeq = SLOT_SEQ.incrementAndGet();
             // 关键：swscale 的 SIMD 路径要求 dst 64 字节对齐。不用 av_malloc（仍在 FFmpeg 外分配），
             // 用 LWJGL 对齐分配器，外部/JVM 管理生命周期。
             this.address = MemoryUtil.nmemAlignedAlloc(64, capacity);
@@ -77,15 +84,80 @@ public class FrameBufferPoolWithQueue {
             imageBuffer.position(0).limit(capacity);
         }
     }
+    /*
+    public static final class AudioBufferMeta {
+        private boolean extraDeta; //描述当前这个Meta是否有数据，仅用于第一层（因为这个需要常驻，跟随slot，必须创建）
+        private int offset;
+        private int length;
+        public AudioBufferMeta audioBufferMeta; //下一个meta数据，==null则没有，可以被extraData忽略
+        public AudioBufferMeta(){
+            this.extraDeta = false;
+            this.offset = 0;
+            this.length = 0;
+            this.audioBufferMeta = null;
+        }
+        public void reset(){
+            this.extraDeta = false;
+            this.offset = 0;
+            this.length = 0;
+            this.audioBufferMeta = null;
+        }
+        public boolean hasExtraData(){return this.extraDeta;}
+        public int getOffset(){return this.offset;}
+        public int getLength(){return this.length;}
+        public void write(int offset,int length,AudioBufferMeta audioBufferMeta){
+            this.extraDeta = true;
+            this.offset = offset;
+            this.length = length;
+            this.audioBufferMeta = audioBufferMeta;
+        }
+        public void write(int offset,int length){
+            this.write(offset,length,null);
+        }
+        public AudioBufferMeta writeChain(int offset,int length){
+            AudioBufferMeta audioBufferMeta = new AudioBufferMeta();
+            this.write(offset,length,audioBufferMeta);
+            return audioBufferMeta;
+        }
+        public void writeChainLast(int offset,int length){
+            this.write(offset,length);
+        }
+    }*/
+    public static final class AudioBufferMeta{
+        public boolean hasData;    // 本条是否有数据（常驻第一条天然为 true/主帧）
+        public int    offset;      // 帧数据在槽 buffer 中的起始字节
+        public int    length;      // 帧数据字节数
+        public long   ptsUs;       // 本帧时间戳（微秒）——逐帧独立，消费端同步用
+        public AudioBufferMeta(){
+            this.reset();
+        }
+        public void reset() {
+            this.hasData = false;
+            this.offset = 0;
+            this.length = 0;
+            this.ptsUs = 0L;
+        }
+
+        public void write(int offset, int length, long ptsUs) {
+            this.hasData = true;
+            this.offset = offset;
+            this.length = length;
+            this.ptsUs = ptsUs;
+        }
+
+    }
     public static final class AudioBufferSlot{
         public final ByteBuffer audioBuffer;
         public final BytePointer audioPointer;
         public final PointerPointer audioPointerPtr;
         public final long address;
-        public final int capacity;// 帧数据字节数
+        public final int capacity;
+        public final AudioBufferMeta extraBufferMeta = new AudioBufferMeta();
+        public final int index;
+        public int length;      // 帧数据字节数
         public long ptsUs;
 
-        AudioBufferSlot(int capacity) {
+        AudioBufferSlot(int capacity,int index) {
             this.capacity = capacity;
             // 关键：swresample 的 SIMD 路径（与 swscale 同理）要求 dst 64 字节对齐。
             // 用 LWJGL 对齐分配器，外部/JVM 管理生命周期。
@@ -98,6 +170,7 @@ public class FrameBufferPoolWithQueue {
             // 关键：sws_scale 会检查 dst[0]/dst[1]/dst[2] 三个槽（swscale.c: "bad dst image pointers"）。
             // 只给 1 个指针会导致 C 侧越界读。提供 4 个槽（同指针重复填充，packed RGBA 只用 dst[0]）。
             this.audioPointerPtr = new PointerPointer<>(audioPointer, audioPointer, audioPointer, audioPointer);
+            this.index = index;
         }
 
         public void resetPosition() {audioBuffer.position(0).limit(capacity);
@@ -110,18 +183,24 @@ public class FrameBufferPoolWithQueue {
     /** 就绪队列：已解码待上传（解码线程发布、渲染线程获取） */
     private final BlockingQueue<ImageBufferSlot> imageReadyQueue;
 
-    private final BlockingQueue<AudioBufferSlot> audioFreePool;
-    private AudioBufferSlot tmpAudioSlot;
+    private final BlockingQueue<AudioBufferSlot> audioFreePoolSmall;//index0
+    private final int audioDataCapacitySmall;
+    private final BlockingQueue<AudioBufferSlot> audioFreePoolCommon;//index1
+    private final int audioDataCapacityCommon;
+    private final BlockingQueue<AudioBufferSlot> audioFreePoolMiddle;//index2
+    private final int audioDataCapacityMiddle;
+    private final BlockingQueue<AudioBufferSlot> audioFreePoolLarge;//index3
+    private final int audioDataCapacityLarge;
+    private final List<BlockingQueue<AudioBufferSlot>> audioFreePoolList;
+    private final List<Integer> audioCapacityIndex;
 
     private final BlockingQueue<AudioBufferSlot> audioReadyQueue;
 
     public final int width;
     public final int height;
     public final int imageDataCapacity;
-    public final int audioDataCapacity;
     public final int imageBufferCount;
     public final int audioBufferCount;
-    public boolean audioEND = false;
 
     /**
      * @param imageBufferCount   视频帧预分配槽总数（建议 2~3，即双/三缓冲流水线）
@@ -138,26 +217,120 @@ public class FrameBufferPoolWithQueue {
         this.audioBufferCount = audioBufferCount;
         this.imageFreePool = new LinkedBlockingQueue<>(imageBufferCount);
         this.imageReadyQueue = new LinkedBlockingQueue<>(imageBufferCount);
-        this.poolSeq = POOL_SEQ.incrementAndGet();
         // 预分配全部槽，之后生命周期内零 new
         for (int i = 0; i < imageBufferCount; i++) {
-            this.imageFreePool.offer(new ImageBufferSlot(this.imageDataCapacity));
+            imageFreePool.offer(new ImageBufferSlot(this.imageDataCapacity));
         }
         if(audioCodecContext != null) {
-            // ★ 每帧一槽：swr_convert 单帧输出（AAC 1024 样本≈8KB、MP3 1152≈4.6KB）
-            //   给 16384 裕量，一帧放得下；MC read() 拿到 8~16KB 一帧即可上传播放。
-            this.audioDataCapacity = 16384 * 4;
-            this.audioFreePool = new LinkedBlockingQueue<>(audioBufferCount);
-            this.audioReadyQueue = new LinkedBlockingQueue<>(audioBufferCount);
-            // ★ 修复：for 末尾不能有分号！旧代码 `for(...);{...}` 循环体为空、块只执行一次，
-            //   导致 audioBufferCount 个槽实际只预分配 1 个 → ready 恒 1、startAudio 预滚永远不足。
-            for (int i = 0; i < audioBufferCount; i++) {
-                this.audioFreePool.offer(new AudioBufferSlot(this.audioDataCapacity));
+            int codecID = audioCodecContext.codec_id();
+            Set<Integer> constanceCapacity = Set.of(
+                    AV_CODEC_ID_AAC,
+                    AV_CODEC_ID_MP2,
+                    AV_CODEC_ID_MP3,
+                    AV_CODEC_ID_DTS,
+                    AV_CODEC_ID_AC3
+            );
+            Set<Integer> varietyCapacity = Set.of(
+                    AV_CODEC_ID_OPUS,
+                    AV_CODEC_ID_VORBIS,
+                    AV_CODEC_ID_FLAC
+            );
+            if (constanceCapacity.contains(codecID)) {
+                this.audioDataCapacitySmall = -1;
+                this.audioDataCapacityMiddle = -1;
+                this.audioDataCapacityLarge = -1;
+                this.audioFreePoolSmall = null;
+                this.audioFreePoolMiddle = null;
+                this.audioFreePoolLarge = null;
+                this.audioDataCapacityCommon = audioCodecContext.frame_size();
+                this.audioFreePoolCommon = new LinkedBlockingQueue<>(audioBufferCount);
+                for (int i = 0; i < audioBufferCount; i++) {
+                    audioFreePoolCommon.offer(new AudioBufferSlot(this.audioDataCapacityCommon,1));
+                }
+                this.audioReadyQueue = new LinkedBlockingQueue<>(this.audioBufferCount);
+                this.audioFreePoolList = null;
+                this.audioCapacityIndex = null;
+            } else if (varietyCapacity.contains(codecID)) {
+                //2:3:3:2->大池多一点，比例不用精确
+                float part = (float) audioBufferCount / 10;
+                int part_small_integer = (int) (part * 2);
+                int part_common_integer = (int) (part * 3);
+                int part_middle_integer = (int) (part * 3);
+                int part_large_integer = (int) (part * 2);
+                int tmpTotal = audioBufferCount - (part_common_integer + part_large_integer + part_middle_integer + part_small_integer);
+                if (tmpTotal == 3) {
+                    part_middle_integer += 2;
+                    part_large_integer += 1;
+                } else if (tmpTotal == 2) {
+                    part_middle_integer += 1;
+                    part_large_integer += 1;
+                } else if (tmpTotal == 1) {
+                    part_middle_integer += 1;
+                }
+                this.audioFreePoolSmall = new LinkedBlockingQueue<>(part_small_integer);
+                this.audioFreePoolCommon = new LinkedBlockingQueue<>(part_common_integer);
+                this.audioFreePoolMiddle = new LinkedBlockingQueue<>(part_middle_integer);
+                this.audioFreePoolLarge = new LinkedBlockingQueue<>(part_large_integer);
+                this.audioReadyQueue = new LinkedBlockingQueue<>(this.audioBufferCount);
+                //需要优化获取算法
+                final int CHANNELS = 2;
+                final int SAMPLE_16bit = 2;
+                final int BYTE_PER_SAMPLE = CHANNELS * SAMPLE_16bit;
+                if (codecID == AV_CODEC_ID_OPUS) {
+                    this.audioDataCapacitySmall = 120 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityCommon = 960 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityMiddle = 1920 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityLarge = 5760 * BYTE_PER_SAMPLE;
+                } else if (codecID == AV_CODEC_ID_VORBIS) {
+                    this.audioDataCapacitySmall = 64 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityCommon = 2048 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityMiddle = 4096 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityLarge = 8192 * BYTE_PER_SAMPLE;
+                } else {//codecID == AV_CODEC_ID_FLAC
+                    this.audioDataCapacitySmall = 1024 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityCommon = 4096 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityMiddle = 8192 * BYTE_PER_SAMPLE;
+                    this.audioDataCapacityLarge = 65535 * BYTE_PER_SAMPLE;
+                }
+                this.audioFreePoolList = List.of(
+                        this.audioFreePoolSmall,
+                        this.audioFreePoolCommon,
+                        this.audioFreePoolMiddle,
+                        this.audioFreePoolLarge
+                );
+                this.audioCapacityIndex = List.of(
+                        this.audioDataCapacitySmall,
+                        this.audioDataCapacityCommon,
+                        this.audioDataCapacityMiddle,
+                        this.audioDataCapacityLarge
+                );
+                for (int i = 0; i < part_small_integer; i++) {
+                    audioFreePoolSmall.offer(new AudioBufferSlot(this.audioDataCapacitySmall,0));
+                }
+                for (int i = 0; i < part_common_integer; i++) {
+                    audioFreePoolCommon.offer(new AudioBufferSlot(this.audioDataCapacityCommon,1));
+                }
+                for (int i = 0; i < part_middle_integer; i++) {
+                    audioFreePoolMiddle.offer(new AudioBufferSlot(this.audioDataCapacityMiddle,2));
+                }
+                for (int i = 0; i < part_large_integer; i++) {
+                    audioFreePoolLarge.offer(new AudioBufferSlot(this.audioDataCapacityLarge,3));
+                }
+            } else {
+                throw new IllegalArgumentException("Unsupported Audio Format!");
             }
         }else {
-            this.audioFreePool = null;
-            this.audioDataCapacity = -1;
+            this.audioFreePoolSmall = null;
+            this.audioFreePoolCommon = null;
+            this.audioFreePoolMiddle = null;
+            this.audioFreePoolLarge = null;
+            this.audioDataCapacitySmall = -1;
+            this.audioDataCapacityCommon = -1;
+            this.audioDataCapacityMiddle = -1;
+            this.audioDataCapacityLarge = -1;
+            this.audioFreePoolList = null;
             this.audioReadyQueue = null;
+            this.audioCapacityIndex = null;
         }
     }
 
@@ -171,21 +344,49 @@ public class FrameBufferPoolWithQueue {
     }
     /** 借出一个空闲槽：按需选起始档，本档空则向上借大档，全部空则阻塞等待。 */
     public AudioBufferSlot borrowAudioBuffer(int size) throws InterruptedException {
-        AudioBufferSlot slot = audioFreePool.take();
-        slot.resetPosition();
-        return slot;
+        if (audioFreePoolList == null) {
+            // 固定帧大小编码器：单档（common）
+            AudioBufferSlot slot = audioFreePoolCommon.take();
+            slot.resetPosition();
+            return slot;
+        }
+        // 起始档：第一个容量 >= size 的档
+        int level = 0;
+        for (int i = 0; i < audioCapacityIndex.size(); i++) {
+            if (size > audioCapacityIndex.get(i)) level = i + 1;
+        }
+        // 本档及更大档轮询；全空则阻塞等待（背压=消费端归还），不走特批 new（保持零 new 池化）
+        while (true) {
+            for (int i = level; i < audioFreePoolList.size(); i++) {
+                AudioBufferSlot slot = audioFreePoolList.get(i).poll();
+                if (slot != null) {
+                    slot.resetPosition();
+                    return slot;
+                }
+            }
+            Thread.sleep(1L); // 短暂让出，等消费端 release 归还
+        }
     }
 
     /** 非阻塞借出音频槽：按需选起始档向上找，全空返回 null（调用方据此让出）。 */
-    public AudioBufferSlot tryBorrowAudioBuffer() {
-        if (this.tmpAudioSlot != null) return this.tmpAudioSlot;
-        AudioBufferSlot slot = audioFreePool.poll();
-        if (slot != null) {
-            slot.resetPosition();
-            slot.audioBuffer.clear();
-            this.tmpAudioSlot = slot;
+    public AudioBufferSlot tryBorrowAudioBuffer(int size) {
+        if (audioFreePoolList == null) {
+            AudioBufferSlot slot = audioFreePoolCommon.poll();
+            if (slot != null) slot.resetPosition();
+            return slot;
         }
-        return slot;
+        int level = 0;
+        for (int i = 0; i < audioCapacityIndex.size(); i++) {
+            if (size > audioCapacityIndex.get(i)) level = i + 1;
+        }
+        for (int i = level; i < audioFreePoolList.size(); i++) {
+            AudioBufferSlot slot = audioFreePoolList.get(i).poll();
+            if (slot != null) {
+                slot.resetPosition();
+                return slot;
+            }
+        }
+        return null; // 全空：队列满，外部驱动循环稍后再试
     }
 
     /** 非阻塞借出；无空闲返回 null。 */
@@ -200,42 +401,18 @@ public class FrameBufferPoolWithQueue {
         imageReadyQueue.put(slot);
     }
     public void publishAudioBuffer(AudioBufferSlot slot) throws InterruptedException {
-        if (slot != null){
-            ByteBuffer byteBuffer = slot.audioBuffer;
-            int pos = byteBuffer.position();
-            if (pos > 0){
-                byteBuffer.flip();               // position=0, limit=pos（有效字节）
-                this.tmpAudioSlot = null;        // 每帧一槽：立即清累积
-                audioReadyQueue.put(slot);       // ★ 有数据即发布，不等满（MC read 立刻能取）
-            }else {
-                this.tmpAudioSlot = null;        // 空槽退池，不发布
-                releaseAudioBuffer(slot);
-            }
-        }else {
-            if (this.tmpAudioSlot != null){
-                AudioBufferSlot s = this.tmpAudioSlot;
-                this.tmpAudioSlot = null;
-                publishAudioBuffer(s);           // EOF 尾部有数据则发布
-            }
-        }
+        audioReadyQueue.put(slot);
     }
     // ==================== 渲染线程（消费者） ====================
 
     /** 获取一张已解码待上传的帧；无帧时阻塞等待解码线程。 */
-    public ImageBufferSlot acquireImage() throws InterruptedException {
+    public ImageBufferSlot acquire() throws InterruptedException {
         return imageReadyQueue.take();
     }
-    public AudioBufferSlot acquireAudio() throws InterruptedException {
-        return audioReadyQueue.take();
-    }
+
     /** 非阻塞获取；无就绪帧返回 null。 */
     public ImageBufferSlot tryAcquireImageBuffer() {
         return imageReadyQueue.poll();
-    }
-
-    /** 非破坏性查看队头就绪帧（PTS 门控用，不弹出）。 */
-    public ImageBufferSlot peekImageBuffer() {
-        return imageReadyQueue.peek();
     }
 
     public AudioBufferSlot tryAcquireAudioBuffer() {
@@ -249,7 +426,13 @@ public class FrameBufferPoolWithQueue {
     }
     public void releaseAudioBuffer(AudioBufferSlot slot) {
         slot.resetPosition();
-        this.audioFreePool.offer(slot);
+        slot.extraBufferMeta.reset(); // 复位打包元信息，防脏数据复用
+        if (audioFreePoolList != null) {
+            this.audioFreePoolList.get(slot.index).offer(slot);
+        } else {
+            // 固定帧大小编码器：单档，直接回 common 池
+            this.audioFreePoolCommon.offer(slot);
+        }
     }
     // ==================== 状态查询 ====================
 
@@ -267,49 +450,43 @@ public class FrameBufferPoolWithQueue {
         return audioReadyQueue.remainingCapacity() == 0;
     }
 
-    /** 视频空闲槽是否已耗尽（解码侧据此让出，防止无槽接收解码帧而丢帧）。 */
-    public boolean isImageFreeEmpty() {
-        return imageFreePool.isEmpty();
-    }
-
-    /** 音频空闲槽是否已耗尽。 */
-    public boolean isAudioFreeEmpty() {
-        return audioFreePool != null && audioFreePool.isEmpty();
-    }
-
     public int getImageReadyCount() {
         return imageReadyQueue.size();
-    }
-
-    /** 音频就绪队列当前积压槽数（startAudio 预滚检查用）。 */
-    public int getAudioReadyCount() {
-        return audioReadyQueue != null ? audioReadyQueue.size() : 0;
     }
 
     public int getImageFreeCount() {
         return imageFreePool.size();
     }
 
-    /** 音频空闲池当前槽数（drainAudioBuffer 是否因无空闲槽而卡住的判定用）。 */
-    public int getAudioFreeCount() {
-        return audioFreePool != null ? audioFreePool.size() : 0;
-    }
-
     /** 释放所有槽的对齐内存（nmemAlignedAlloc 的成对释放）。 */
     public void close() {
         ImageBufferSlot imageSlot;
-        AudioBufferSlot audioSlot;
         while ((imageSlot = imageFreePool.poll()) != null) {
             if (imageSlot.address != 0L) MemoryUtil.nmemAlignedFree(imageSlot.address);
         }
         while ((imageSlot = imageReadyQueue.poll()) != null) {
             if (imageSlot.address != 0L) MemoryUtil.nmemAlignedFree(imageSlot.address);
         }
-        while ((audioSlot = audioFreePool.poll()) != null) {
-            if (audioSlot.address != 0L) MemoryUtil.nmemAlignedFree(audioSlot.address);
+
+        // 释放音频槽（多档 + 单档两种情况）
+        if (audioFreePoolList != null) {
+            for (BlockingQueue<AudioBufferSlot> q : audioFreePoolList) {
+                AudioBufferSlot s;
+                while ((s = q.poll()) != null) {
+                    if (s.address != 0L) MemoryUtil.nmemAlignedFree(s.address);
+                }
+            }
+        } else if (audioFreePoolCommon != null) {
+            AudioBufferSlot s;
+            while ((s = audioFreePoolCommon.poll()) != null) {
+                if (s.address != 0L) MemoryUtil.nmemAlignedFree(s.address);
+            }
         }
-        while ((audioSlot = audioReadyQueue.poll()) != null) {
-            if (audioSlot.address != 0L) MemoryUtil.nmemAlignedFree(audioSlot.address);
+        if (audioReadyQueue != null) {
+            AudioBufferSlot s;
+            while ((s = audioReadyQueue.poll()) != null) {
+                if (s.address != 0L) MemoryUtil.nmemAlignedFree(s.address);
+            }
         }
     }
 }

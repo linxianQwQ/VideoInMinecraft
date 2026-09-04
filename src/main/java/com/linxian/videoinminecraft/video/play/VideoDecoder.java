@@ -1,7 +1,8 @@
-package com.linxian.videoinminecraft.video;
+package com.linxian.videoinminecraft.video.play;
 
 import com.linxian.videoinminecraft.VideoInMinecraft;
-import com.linxian.videoinminecraft.video.tool.FFmpegFrameGrabber;
+import com.linxian.videoinminecraft.video.play.tool.FFmpegFrameGrabber;
+import com.linxian.videoinminecraft.video.play.tool.FrameBufferPoolWithQueue;
 import net.neoforged.fml.loading.FMLLoader;
 
 import java.io.IOException;
@@ -27,7 +28,7 @@ public class VideoDecoder {
         public String getReason() { return reason; }
     }
 
-    public record CreateDecoderResult(boolean isSuccess, CreateDecoderResultReason resultReason, VideoDecoder videoDecoder) {
+    public record CreateDecoderResult(boolean isSuccess, CreateDecoderResultReason resultReason, VideoDecoder videoDecoder,Integer decoderID) {
         @Override
         public VideoDecoder videoDecoder() {
             if (isSuccess) return videoDecoder;
@@ -40,9 +41,10 @@ public class VideoDecoder {
     private static final Path VIDEO_ROOT = FMLLoader.getGamePath().resolve("config").resolve(VideoInMinecraft.MOD_ID);
 
     public static boolean isFull() { return ACTIVE_VIDEO_DECODER.get() == MAX_VIDEO_DECODER; }
+    private static final AtomicInteger DecoderID = new AtomicInteger(0);
 
     public static CreateDecoderResult createVideoDecode(String videoName) {
-        if (isFull()) return new CreateDecoderResult(false, CreateDecoderResultReason.FULL, null);
+        if (isFull()) return new CreateDecoderResult(false, CreateDecoderResultReason.FULL, null,null);
         if (!Files.exists(VIDEO_ROOT)) {
             try {
                 Files.createDirectories(VIDEO_ROOT);
@@ -52,7 +54,7 @@ public class VideoDecoder {
         }
         Path videoPath = VIDEO_ROOT.resolve(videoName);
         if (!Files.exists(videoPath))
-            return new CreateDecoderResult(false, CreateDecoderResultReason.FILE_NOT_EXIST, null);
+            return new CreateDecoderResult(false, CreateDecoderResultReason.FILE_NOT_EXIST, null,null);
 
         FFmpegFrameGrabber grabber;
         try {
@@ -63,10 +65,11 @@ public class VideoDecoder {
         }
 
         VideoDecoder videoDecoder = new VideoDecoder(grabber, videoPath);
-        CreateDecoderResult result = new CreateDecoderResult(true, CreateDecoderResultReason.SUCCESS, videoDecoder);
+        CreateDecoderResult result = new CreateDecoderResult(true, CreateDecoderResultReason.SUCCESS, videoDecoder,DecoderID.get());
 
         ACTIVE_VIDEO_DECODER.incrementAndGet();
         LIVE_DECODERS.put(videoDecoder, Boolean.TRUE);
+        DecoderID.incrementAndGet();
         return result;
     }
 
@@ -84,28 +87,20 @@ public class VideoDecoder {
         LIVE_DECODERS.clear();
     }
 
-    public enum State {
-        READY,
-        PLAYING,
+    private enum DecodeState {
         PAUSE,
+        DECODING,
         DESTROYED
     }
 
-    private volatile State current = State.READY;
+    private volatile DecodeState current = DecodeState.PAUSE;
+    public boolean isDestroyed() { return current == DecodeState.DESTROYED; }
+    public boolean isPause() { return current == DecodeState.PAUSE; }
+    public boolean isDecoding() { return current == DecodeState.DECODING; }
 
-    public State get() { return current; }
-    public boolean isDestroyed() { return current == State.DESTROYED; }
-    public boolean isPause() { return current == State.PAUSE; }
-    public boolean isPlaying() { return current == State.PLAYING; }
-    public boolean isReady() { return current == State.READY; }
-    public boolean isSafeForGetData() {
-        return current == State.READY || current == State.PLAYING || current == State.PAUSE;
-    }
-
-    private synchronized void State_READY() { if (current == State.PLAYING) current = State.READY; }
-    private synchronized void State_PLAYING() { if (current == State.READY || current == State.PAUSE) current = State.PLAYING; }
-    private synchronized void State_PAUSE() { if (current == State.PLAYING) current = State.PAUSE; }
-    private synchronized void State_DESTORY() { current = State.DESTROYED; }
+    private synchronized void State_PAUSE() { if (!isDestroyed()) current = DecodeState.PAUSE; }
+    private synchronized void State_DECODE() { if (!isDestroyed()) current = DecodeState.DECODING; }
+    private synchronized void State_DESTORY() { current = DecodeState.DESTROYED; }
 
     private final Path VIDEO_PATH;
     private final FFmpegFrameGrabber grabber;
@@ -139,35 +134,36 @@ public class VideoDecoder {
         this.grabber = grabber;
         this.grabExecutor = Executors.newSingleThreadExecutor();
     }
+
     public synchronized void destroy() {
         this.State_DESTORY();
         LIVE_DECODERS.remove(this);
-        if (this.grabber != null) this.grabber.close();
+        if (this.grabber != null) {
+            this.grabber.close();
+            this.grabber.getPool().close();
+        }
         this.grabExecutor.shutdownNow();
         ACTIVE_VIDEO_DECODER.decrementAndGet();
     }
 
-    public long playStartSystemNano;
-    private long currentTimeUs;
-
     /** 启动单线程驱动循环：交替推进视频与音频解码（非阻塞单次），满槽/暂停时 sleep 让出。 */
-    public synchronized void PlayVideo() {
-        if (this.isReady()) {
-            playStartSystemNano = System.nanoTime();
+    public synchronized void StartDecodeThread() {
+        if (this.isPause()) {
             this.grabExecutor.submit(() -> {
+                this.State_DECODE();
                 while (!isDestroyed()) {
                     if (isPause()) {
-                        try { Thread.sleep(30L); } catch (InterruptedException e) { break; }
-                        continue;
+                        break;
                     }
                     try {
-                        if (this.grabber.isFinished()) break; // 双流结束
+                        if (this.grabber.isFinished()){
+                            this.grabber.reset();
+                            break;
+                        } // 双流结束
 
                         // 对称推进一次：视频一步 + 音频一步（非阻塞）
                         boolean advanced = this.grabber.grab();
-                        currentTimeUs = this.grabber.getLastVideoTimestampUs();
                         if (!advanced) {
-                            // 本次无推进（队列满 / EAGAIN 待喂包 / EOF 等待 flush 排空）：短暂让出
                             Thread.sleep(1L);
                         }
                     } catch (Exception e) {
@@ -175,17 +171,19 @@ public class VideoDecoder {
                         break;
                     }
                 }
+                this.State_PAUSE();
             });
-            this.State_PLAYING();
         }
     }
 
-    public synchronized void Pause() {
-        this.State_PAUSE();
+    public void seek(long targetSecond){
+        if (!this.isPause()) return;
+        this.grabber.seek(targetSecond);
+        this.State_DECODE();
+        this.StartDecodeThread();
     }
 
-    /** 供渲染线程/外部访问管道池（acquire/release）。 */
-    public FFmpegFrameGrabber getGrabber() {
-        return grabber;
+    public FrameBufferPoolWithQueue getPool() {
+        return this.grabber.getPool();
     }
 }

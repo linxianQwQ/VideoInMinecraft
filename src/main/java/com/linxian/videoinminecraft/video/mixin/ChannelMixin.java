@@ -1,6 +1,7 @@
 package com.linxian.videoinminecraft.video.mixin;
 
-import com.linxian.videoinminecraft.video.play.AudioPlay;
+import com.linxian.videoinminecraft.VideoInMinecraft;
+import com.linxian.videoinminecraft.video.play.AudioPlayer;
 import com.mojang.blaze3d.audio.Channel;
 import net.minecraft.client.sounds.AudioStream;
 import org.spongepowered.asm.mixin.Mixin;
@@ -26,7 +27,7 @@ public class ChannelMixin {
             )
     )
     private void videoInMinecraft$releaseBuffer(CallbackInfo ci) {
-        if (this.stream instanceof AudioPlay.VideoAudioStream vas) {
+        if (this.stream instanceof AudioPlayer.VideoAudioStream vas) {
             Runnable release = vas.release;
             if (release != null) {
                 release.run();
@@ -40,24 +41,27 @@ public class ChannelMixin {
      */
     @Inject(method = "play", at = @At("HEAD"))
     private void videoInMinecraft$playStart(CallbackInfo ci) {
-        if (this.stream instanceof AudioPlay.VideoAudioStream vas) {
+        if (this.stream instanceof AudioPlayer.VideoAudioStream vas) {
             vas.notifyPlayStart();
+            VideoInMinecraft.LOGGER.debug("start");
         }
     }
 
     /** 音频暂停（游戏菜单暂停等）：冻结主时钟，避免恢复后快进追赶。 */
     @Inject(method = "pause", at = @At("HEAD"))
     private void videoInMinecraft$pauseStart(CallbackInfo ci) {
-        if (this.stream instanceof AudioPlay.VideoAudioStream vas) {
+        if (this.stream instanceof AudioPlayer.VideoAudioStream vas) {
             vas.notifyPause();
+            VideoInMinecraft.LOGGER.debug("pause");
         }
     }
 
     /** 音频恢复：继续推进主时钟。 */
     @Inject(method = "unpause", at = @At("HEAD"))
     private void videoInMinecraft$resumeStart(CallbackInfo ci) {
-        if (this.stream instanceof AudioPlay.VideoAudioStream vas) {
+        if (this.stream instanceof AudioPlayer.VideoAudioStream vas) {
             vas.notifyResume();
+            VideoInMinecraft.LOGGER.debug("resume");
         }
     }
 }

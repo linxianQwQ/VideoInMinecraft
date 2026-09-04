@@ -12,9 +12,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class SoundEngineMixin {
     @Inject(method = "reload", at = @At("TAIL"))
     private void videoInMinecraft$afterReload(CallbackInfo ci) {
-        VideoInMinecraft.client.soundEngineReady = true;
-        if (VideoInMinecraft.client.videoScreen != null) {
-            VideoInMinecraft.client.videoScreen.onSoundEngineReady();
-        }
+
     }
 }

@@ -1,22 +1,17 @@
 package com.linxian.videoinminecraft.client;
 
 import com.linxian.videoinminecraft.VideoInMinecraft;
-import com.linxian.videoinminecraft.video.VideoDecoder;
-import com.linxian.videoinminecraft.video.VideoScreen;
-import net.minecraft.client.KeyMapping;
+import com.linxian.videoinminecraft.video.VideoPlayer;
+import com.linxian.videoinminecraft.video.play.VideoDecoder;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.api.distmarker.OnlyIn;
 import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
-import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
 import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.event.GameShuttingDownEvent;
-import org.lwjgl.glfw.GLFW;
-
 
 
 import static com.linxian.videoinminecraft.Register.*;
@@ -24,8 +19,7 @@ import static com.linxian.videoinminecraft.Register.*;
 public class Client {
     public Client(){}
     private boolean ACTIVE = false;
-    public VideoDecoder videoDecoder;
-    public VideoScreen videoScreen;
+    public VideoPlayer videoPlayer;
     /** OpenAL 上下文是否已就绪（SoundEngineMixin 在 reload TAIL 置位）。 */
     public boolean soundEngineReady = false;
     /** MC 原版创建的 OpenAL context 句柄（SoundEngineMixin 捕获，供 AudioConsumer 强制绑定）。 */
@@ -41,52 +35,17 @@ public class Client {
      * 供客户端启动与进入游戏（LoggingIn）时调用。
      */
     public synchronized void startVideoPlayback() {
-        if (this.videoDecoder != null) return; // 已有播放器
-        VideoDecoder videoDecoder = create("1.mp4");
-        this.videoDecoder = videoDecoder;
+        VideoPlayer video_player = new VideoPlayer("1.mp4");
+        this.videoPlayer = video_player;
         // 解码构造即就绪，但保持原有异步等待语义，等待 READY 后回到主线程创建画布
-        new Thread(() -> {
-            while (true) {
-                // 解码器可能被 LoggingOut 销毁（DESTROYED），此时退出等待
-                if (videoDecoder.isDestroyed()) {
-                    break;
-                }
-                if (videoDecoder.isReady()) {
-                    Minecraft.getInstance().tell(() -> {
-                        VideoScreen screen = new VideoScreen(videoDecoder);
-                        VideoInMinecraft.client.videoScreen = screen;
-                        // ★ 不再自动 startAudio：音频须等解码线程 PlayVideo 启动后（L 键）才送入，
-                        //   否则 read() 阻塞等槽会卡死 SoundEngine。
-                        // 进入世界后自动开始播放（L 键仍然可用）
-                        if (Minecraft.getInstance().player != null) {
-                            VideoInMinecraft.client.ACTIVE = true;
-                        }
-                    });
-                    break;
-                }
-                try {
-                    Thread.sleep(200);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        }).start();
+        this.videoPlayer.startDecoder();
     }
 
     /** 停止播放并销毁全部解码资源（退出到主界面 LoggingOut / 客户端关闭时调用）。 */
     public synchronized void stopVideoPlayback() {
         this.ACTIVE = false;
-        if (this.videoDecoder != null) {
-            VideoInMinecraft.LOGGER.info("Stopping video playback and freeing decoders...");
-            VideoDecoder.StopAll();
-            this.videoDecoder = null;
-        }
         // 先释放 OpenAL 等消费端资源，再置空引用
-        if (this.videoScreen != null) {
-            this.videoScreen.dispose();
-            this.videoScreen = null;
-        }
+        this.videoPlayer.close();
     }
 
     @SubscribeEvent
@@ -97,15 +56,12 @@ public class Client {
         // 使用 consumeClick() 确保只触发一次
         if (startKey.consumeClick()) {
             ACTIVE = true;
-            videoDecoder.PlayVideo();
-            // 送入模型：启动音频由 MC SoundEngine 拉取（须 SoundEngine 已就绪才 play 有效）
-            if (videoScreen != null && soundEngineReady) {
-                videoScreen.startAudio();
-            }
+            videoPlayer.playAudio();
+
+
         }
         if (stopKey.consumeClick()) {
-            ACTIVE = false;
-            if (videoScreen != null) videoScreen.dispose();
+            ACTIVE = false;videoPlayer.dispose();
         }
     }
     @SubscribeEvent
@@ -113,11 +69,6 @@ public class Client {
         // 客户端退出：停止并释放所有解码器（FFmpeg 上下文 + 管道池对齐内存 + 线程）
         VideoInMinecraft.LOGGER.info("Client shutting down, cleaning up video decoders...");
         VideoDecoder.StopAll();
-        if (videoScreen != null) {
-            videoScreen.dispose();
-            videoScreen = null;
-        }
-        videoDecoder = null;
         ACTIVE = false;
     }
 
@@ -126,6 +77,7 @@ public class Client {
     public void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
         VideoInMinecraft.LOGGER.info("Logging out to main menu, freeing video decoders...");
         // stopVideoPlayback 内部已统一处理 videoScreen.dispose()
+        if (this.videoPlayer == null) return;
         stopVideoPlayback();
     }
 
@@ -139,15 +91,15 @@ public class Client {
     @SubscribeEvent
     public void onRender(RenderGuiEvent.Pre event){
         if (!ACTIVE) return;
-        videoScreen.updateVideoTexture();
+        videoPlayer.playImage();
 
         Minecraft mc = Minecraft.getInstance();
         GuiGraphics guiGraphics = event.getGuiGraphics();
         int screenWidth = mc.getWindow().getGuiScaledWidth();
         int screenHeight = mc.getWindow().getGuiScaledHeight();
 
-        int videoWidth = videoScreen.videoWidth;
-        int videoHeight = videoScreen.videoHeight;
+        int videoWidth = videoPlayer.width;
+        int videoHeight = videoPlayer.height;
 
         // 计算缩放比例，使视频完全放入屏幕
         float scaleX = (float) screenWidth / videoWidth;
@@ -165,7 +117,7 @@ public class Client {
         // u,v=采样起点；uWidth/vHeight=采样区域尺寸(必须用完整视频尺寸，否则裁切)；
         // textureWidth/Height=纹理总尺寸(用于 uv 归一化)
         guiGraphics.blit(
-                videoScreen.textureLocation,
+                videoPlayer.textureLocation,
                 offsetX, offsetY,
                 renderWidth, renderHeight,
                 0.0f, 0.0f,

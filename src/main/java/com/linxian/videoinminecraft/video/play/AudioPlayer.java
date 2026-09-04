@@ -1,8 +1,8 @@
 package com.linxian.videoinminecraft.video.play;
 
 import com.linxian.videoinminecraft.VideoInMinecraft;
-import com.linxian.videoinminecraft.video.sync.PlaybackClock;
-import com.linxian.videoinminecraft.video.tool.FrameBufferPoolWithQueue;
+import com.linxian.videoinminecraft.video.play.tool.FrameBufferPoolWithQueue;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.resources.sounds.AbstractSoundInstance;
 import net.minecraft.client.resources.sounds.Sound;
 import net.minecraft.client.sounds.AudioStream;
@@ -19,16 +19,27 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * 视频音频"送入"MC SoundEngine 的实现（零裸 AL）。
- *
- * <p>{@link AudioSoundInstance} 交给 {@code SoundManager.play()} 后，
- * MC 会走流式分支：attachBufferStream → pumpBuffers(4) 预缓存 →
- * 之后每 tick updateStream 补槽；每次 {@code read()} 从管道池取一槽
- * （flip 后 limit=有效字节），返回槽视图（零拷贝）。MC 在 pumpBuffers
- * 循环体内同步 alBufferData 上传完成后，由 {@code ChannelMixin} 调
- * {@link VideoAudioStream#release} 归还槽。
+ * <b>仅用于适配MC的音频打包+播放</b>
  */
-public class AudioPlay {
+public class AudioPlayer {
+    private final FrameBufferPoolWithQueue pool;
+    private final Clock clock;
+    private final AudioSoundInstance soundInstance;
+    public AudioPlayer(FrameBufferPoolWithQueue pool,Clock clock){
+        this.pool = pool;
+        this.clock = clock;
+        this.soundInstance = new AudioSoundInstance(pool, clock);
+    }
+
+
+    /**MC主线程调用:Minecraft.getInstance().tell()*/
+    public void upload(){
+        Minecraft.getInstance().getSoundManager().play(this.soundInstance);
+    }
+    public void dispose() {
+        Minecraft.getInstance().getSoundManager().stop(soundInstance);
+    }
+
 
     /** MC SoundEngine 拉取视频 PCM 的流。 */
     public static class VideoAudioStream implements AudioStream {
@@ -37,18 +48,21 @@ public class AudioPlay {
         private static final int SAMPLE_BITS = 16;           // PCM_SIGNED 16bit
 
         private final FrameBufferPoolWithQueue pool;
-        private final PlaybackClock clock;
-        /**
-         * 最近一次 read() 取出的槽的归还闭包。
-         * ChannelMixin（pumpBuffers 内 releaseAlBuffer 之后）调用它归还该槽。
-         */
-        public volatile Runnable release;
-        /** 停止标志（close 由 MC stop 调用）。 */
-        private volatile boolean eof = false;
-        /** 首个进入队列的音频帧 PTS（归一化≈0），作为 play 时的主时钟锚点。 */
-        private volatile long firstQueuedPtsUs = -1;
+        private final Clock clock;
 
-        public VideoAudioStream(FrameBufferPoolWithQueue pool, PlaybackClock clock) {
+        /** read后记录 归还对象池的方法 的对象，使用Mixin让MC调用 */
+        public volatile Runnable release;
+
+        /** 停止 ，使用Mixin让MC调用 */
+        private volatile boolean eof = false;
+        /** 首个进入队列的音频帧 PTS，作为 play 时的主时钟锚点。 */
+        private volatile long firstQueuedPtsUs = -1;
+        public void reset(){
+            this.firstQueuedPtsUs = -1;
+            this.eof = false;
+        }
+
+        public VideoAudioStream(FrameBufferPoolWithQueue pool, Clock clock) {
             this.pool = pool;
             this.clock = clock;
         }
@@ -65,20 +79,21 @@ public class AudioPlay {
         @Override
         public ByteBuffer read(int size) throws IOException {
             if (eof) return null;
-            // ★ 非阻塞：拿不到槽立即返回 null，绝不 sleep——SoundEngine 是单线程事件循环，
-            //   阻塞会卡死 MC 所有声音。预缓存保证在 startAudio 前 readyQueue 已攒够槽，
-            //   这里总能拿到；读空只是过渡（解码慢时 MC 跳过本轮）。
+            if (this.pool.isRecycle()){
+                this.pool.readyForFrozen();
+                return null;
+            }
             FrameBufferPoolWithQueue.AudioBufferSlot slot = pool.tryAcquireAudioBuffer();
             if (slot == null) {
                 return null;
             }
-            // 记录首个进入队列的音频帧 PTS（预缓存 4 次都会走这里；只取第一次）
+            // 仅记录一次
             if (firstQueuedPtsUs < 0) {
-                firstQueuedPtsUs = slot.ptsUs;
+                this.firstQueuedPtsUs = slot.ptsUs;
             }
-            final FrameBufferPoolWithQueue.AudioBufferSlot done = slot;  // effectively final
+            final FrameBufferPoolWithQueue.AudioBufferSlot done = slot;
             release = () -> pool.releaseAudioBuffer(done);
-            return done.audioBuffer;                         // 零拷贝：MC 紧随 alBufferData 同步上传
+            return done.audioBuffer;
         }
 
         /**
@@ -87,7 +102,8 @@ public class AudioPlay {
          */
         public void notifyPlayStart() {
             if (firstQueuedPtsUs >= 0) {
-                clock.onAudioPlayStart(firstQueuedPtsUs);
+                clock.setAudioTimeCallBack(firstQueuedPtsUs);
+                clock.start();
             }
         }
 
@@ -113,7 +129,7 @@ public class AudioPlay {
         private final VideoAudioStream stream;
         private final Sound videoSound;
 
-        public AudioSoundInstance(FrameBufferPoolWithQueue pool, PlaybackClock clock) {
+        public AudioSoundInstance(FrameBufferPoolWithQueue pool, Clock clock) {
             // ★ 用 intentionally_empty location：AbstractSoundInstance.resolve 对它特判返回非 null 的
             //   INTENTIONALLY_EMPTY_SOUND_EVENT，确保 SoundEngine.play 通过 null 检查进入流式分支。
             //   （不能用 SoundEvents.EMPTY——minecraft:empty 未注册时 resolve 返回 null 直接无声音）
@@ -132,6 +148,7 @@ public class AudioPlay {
                     0
             );
         }
+        public void reset(){this.stream.reset();}
 
         public VideoAudioStream getStream() {
             return this.stream;

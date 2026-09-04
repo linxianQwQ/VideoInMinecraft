@@ -2,6 +2,7 @@ package com.linxian.videoinminecraft.client;
 
 import com.linxian.videoinminecraft.VideoInMinecraft;
 import net.minecraft.client.KeyMapping;
+import net.minecraft.client.Minecraft;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
@@ -20,11 +21,6 @@ public class ClientRegister {
         stopKey = new KeyMapping(KEY_STOP, GLFW.GLFW_KEY_I, KEY_CATEGORY);
         event.register(startKey);
         event.register(stopKey);
-    }
-    @SubscribeEvent
-    public void onStarted(FMLClientSetupEvent event){
-        // 客户端启动：创建视频播放器（解码器 → 等 ready → 主线程建 VideoScreen）
-        VideoInMinecraft.client.startVideoPlayback();
     }
 
 }

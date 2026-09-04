@@ -1,4 +1,4 @@
-package com.linxian.videoinminecraft.video.tool;
+package com.linxian.videoinminecraft.video.play.tool;
 
 import com.linxian.videoinminecraft.VideoInMinecraft;
 import org.bytedeco.ffmpeg.avcodec.AVCodec;
@@ -14,10 +14,14 @@ import org.bytedeco.ffmpeg.swresample.SwrContext;
 import org.bytedeco.ffmpeg.swscale.SwsContext;
 import org.bytedeco.javacpp.DoublePointer;
 import org.bytedeco.javacpp.IntPointer;
+import org.bytedeco.javacpp.Pointer;
 import org.bytedeco.javacpp.PointerPointer;
+import org.lwjgl.system.MemoryUtil;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -63,7 +67,9 @@ public class FFmpegFrameGrabber implements AutoCloseable {
         /** 容器仍可读包。 */
         OPEN,
         /** 容器已读到底（av_read_frame 返回负值）。 */
-        END
+        END,
+        /** 冻结模式 **/
+        SEEK
     }
 
     private final int width;
@@ -99,14 +105,18 @@ public class FFmpegFrameGrabber implements AutoCloseable {
     private CodecState audioCodecState = CodecState.DISABLE;
     private ContainerState containerState = ContainerState.OPEN;
 
+    public boolean isSeek(){ return containerState == ContainerState.SEEK;}
+
     /** 交叉投递的包队列：按 duration 水位（微秒）背压，避免读穿容器。 */
-    private final AVPacketQueue audioPendingPackets = new AVPacketQueue(300_000,600_000);
+    private final AVPacketQueue audioPendingPackets = new AVPacketQueue(300_000,1_500_000);
     private final AVPacketQueue imagePendingPackets = new AVPacketQueue(300_000,1_500_000);
     public class AVPacketQueue{
 
         private final long Low_Water;
         private final long High_Water;
         private volatile AtomicLong nowSize = new AtomicLong(0);
+        /** [MEMPROBE] 解码前压缩字节占用（offered 包 data 字节；pool 中空闲空包不计）。 */
+        private final AtomicLong nowBytes = new AtomicLong(0);
         private final BlockingQueue<AVPacket> pool = new LinkedBlockingQueue<>();
         private final BlockingQueue<AVPacket> readyQueue = new LinkedBlockingQueue<>();
         private final BlockingQueue<Long> readyDuration = new LinkedBlockingQueue<>();
@@ -118,6 +128,10 @@ public class FFmpegFrameGrabber implements AutoCloseable {
         /**单位：us**/
         public long size(){
             return this.nowSize.get();
+        }
+        /** [MEMPROBE] 解码前压缩字节（bytes）。 */
+        public long bytes(){
+            return this.nowBytes.get();
         }
         public void release(AVPacket packet){
             this.pool.offer(packet);
@@ -139,6 +153,7 @@ public class FFmpegFrameGrabber implements AutoCloseable {
                 assert d != null;
                 long duration = d;
                 this.nowSize.addAndGet(-duration);
+                this.nowBytes.addAndGet(-packet.size()); // [MEMPROBE]
             }
             return packet;
         }
@@ -148,22 +163,42 @@ public class FFmpegFrameGrabber implements AutoCloseable {
             long duration = av_rescale_q(packet.duration(),fmtCtx.streams(packet.stream_index()).time_base(),av_make_q(1,1000000));
             this.readyDuration.offer(duration);
             this.nowSize.addAndGet(duration);
+            this.nowBytes.addAndGet(packet.size()); // [MEMPROBE]
             return true;
         }
         public boolean isHungry(){
             return this.nowSize.get() < this.Low_Water;
         }
         public void freeAll(){
-            for (AVPacket packets:this.readyQueue){
+            ArrayList<AVPacket> list = new ArrayList<>();
+            this.readyQueue.drainTo(list);
+            for (AVPacket packets:list){
                 av_packet_free(packets);
             }
-            for (AVPacket packets:this.pool){
+            list = new ArrayList<>();
+            this.pool.drainTo(list);
+            for (AVPacket packets:list){
                 av_packet_free(packets);
             }
+            this.readyDuration.clear();
+            this.nowSize.set(0L);
+        }
+        public void recycleAll(){
+            ArrayList<AVPacket> list = new ArrayList<>();
+            this.readyQueue.drainTo(list);
+            for (AVPacket packets:list){
+                av_packet_unref(packets);
+                release(packets);
+            }
+            this.readyDuration.clear();
+            this.nowSize.set(0L);
         }
     }
 
     private static final int AV_SUCCESS = 0;
+
+    /** [MEMPROBE] 内存占用统计探针（调试用，可整体删除）。 */
+    private final MemoryProbe memoryProbe = new MemoryProbe();
 
     public CodecState getImageCodecState() { return imageCodecState; }
     public CodecState getAudioCodecState() { return audioCodecState; }
@@ -251,6 +286,7 @@ public class FFmpegFrameGrabber implements AutoCloseable {
         audioFrame = audio ? av_frame_alloc() : null;
     }
 
+
     // ==================== grab 单接口推进（视频一步 + 音频一步，对称） ====================
 
     /**
@@ -270,6 +306,10 @@ public class FFmpegFrameGrabber implements AutoCloseable {
         advanced |= DemuxAndDistributionPacket();
         advanced |= feedVideoPacket();
         advanced |= feedAudioPacket();
+        // [MEMPROBE] 采样当前内存占用
+        memoryProbe.sample(
+                audioPendingPackets.bytes() + imagePendingPackets.bytes(),
+                pool.getPostDecodeBytes());
         return advanced;
     }
 
@@ -456,10 +496,67 @@ public class FFmpegFrameGrabber implements AutoCloseable {
             return;
         }
         AVPacket old = queue.poll();                 // 满：丢队头最旧包
+        VideoInMinecraft.LOGGER.warn("packetList {} is full!Duration:{}us,HighWater:{}us",queue,queue.nowSize.get(),queue.High_Water);
         if (old != null) {
             av_packet_free(old);
         }
         queue.offer(copy);                           // 此时必成功
+    }
+
+    public void RecycleAll(){
+        if (containerState == ContainerState.SEEK) {
+            VideoInMinecraft.LOGGER.debug("recycle");
+            avformat_flush(this.fmtCtx);
+            avcodec_flush_buffers(this.audioCodecCtx);
+            avcodec_flush_buffers(this.videoCodecCtx);
+            ByteBuffer tmp = MemoryUtil.memAlignedAlloc(64,65535);
+            Pointer pointer = new Pointer(tmp);
+            PointerPointer pointerPointer = new PointerPointer<>(pointer,pointer);
+            swresample.swr_convert(this.swrContext,pointerPointer,65535/4,null,0);
+            pointerPointer = null;
+            pointer = null;
+            MemoryUtil.memAlignedFree(tmp);
+            av_frame_unref(this.audioFrame);
+            av_frame_unref(this.imageFrame);
+            av_packet_unref(this.pkt);
+            this.imagePendingPackets.recycleAll();
+            this.audioPendingPackets.recycleAll();
+            this.pool.Frozen();
+            this.pool.waitForFrozen();
+            this.audioCodecState = CodecState.READY;
+            this.imageCodecState = CodecState.READY;
+            return;
+        }
+        throw new IllegalStateException("Try to recycle all buffer without SEEK signal!");
+    }
+    public void reset(){
+        VideoInMinecraft.LOGGER.debug("reset");
+        this.containerState = ContainerState.SEEK;
+        avformat_seek_file(
+                fmtCtx,
+                -1,
+                0,
+                0,
+                0,
+                0
+        );
+        RecycleAll();
+        this.containerState = ContainerState.OPEN;
+    }
+
+    public void seek(long targetSecond){
+        this.containerState = ContainerState.SEEK;
+        long target = targetSecond * AV_TIME_BASE;
+        avformat_seek_file(
+                fmtCtx,
+                -1,
+                Long.MIN_VALUE,
+                target,
+                Long.MAX_VALUE,
+                AVSEEK_FLAG_BACKWARD
+        );
+        RecycleAll();
+        this.containerState = ContainerState.OPEN;
     }
 
     // ==================== 访问器 ====================
@@ -481,6 +578,9 @@ public class FFmpegFrameGrabber implements AutoCloseable {
     public boolean isFinished() {
         boolean videoDone = imageCodecState == CodecState.FLUSHED;
         boolean audioDone = !audio || audioCodecState == CodecState.FLUSHED;
+        if (videoDone && audioDone) {
+            memoryProbe.printOnEnd(); // [MEMPROBE]
+        }
         return videoDone && audioDone;
     }
 

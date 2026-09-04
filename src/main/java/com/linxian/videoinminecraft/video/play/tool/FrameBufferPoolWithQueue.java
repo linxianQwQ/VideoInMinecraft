@@ -1,5 +1,6 @@
-package com.linxian.videoinminecraft.video.tool;
+package com.linxian.videoinminecraft.video.play.tool;
 
+import com.linxian.videoinminecraft.VideoInMinecraft;
 import org.bytedeco.ffmpeg.avcodec.AVCodecContext;
 import org.bytedeco.javacpp.BytePointer;
 import org.bytedeco.javacpp.PointerPointer;
@@ -35,12 +36,12 @@ import java.util.concurrent.LinkedBlockingQueue;
  * </ul>
  */
 public class FrameBufferPoolWithQueue {
-
-    /** 全局池/槽序号：物理实例判别（identityHashCode 会被 GC/碰撞污染，不可靠）。 */
-    private static final java.util.concurrent.atomic.AtomicInteger POOL_SEQ = new java.util.concurrent.atomic.AtomicInteger();
-    private static final java.util.concurrent.atomic.AtomicInteger SLOT_SEQ = new java.util.concurrent.atomic.AtomicInteger();
-    public final int poolSeq;
-
+    public enum QueueState{
+        READY,
+        FROZEN,
+        /**回收模式**/
+        RECYCLE
+    }
     /** 常驻的可复用缓冲槽。预分配一次，全程零再分配。 */
     public static final class ImageBufferSlot {
         /** 像素缓冲视图（64 字节对齐内存的 ByteBuffer 视图）：GL 上传的像素源 */
@@ -54,11 +55,8 @@ public class FrameBufferPoolWithQueue {
         public final int capacity;
         public long ptsUs;
 
-        public final int slotSeq;   // 全局唯一槽序号（物理判别）
-
         ImageBufferSlot(int capacity) {
             this.capacity = capacity;
-            this.slotSeq = SLOT_SEQ.incrementAndGet();
             // 关键：swscale 的 SIMD 路径要求 dst 64 字节对齐。不用 av_malloc（仍在 FFmpeg 外分配），
             // 用 LWJGL 对齐分配器，外部/JVM 管理生命周期。
             this.address = MemoryUtil.nmemAlignedAlloc(64, capacity);
@@ -95,9 +93,9 @@ public class FrameBufferPoolWithQueue {
             this.audioBuffer = MemoryUtil.memByteBuffer(address, capacity);
             // 包装已有 imageBuffer（new BytePointer(long) 是"分配新内存"，会把 address 当 size → OOM）
             this.audioPointer = new BytePointer(audioBuffer);
-            // 关键：sws_scale 会检查 dst[0]/dst[1]/dst[2] 三个槽（swscale.c: "bad dst image pointers"）。
-            // 只给 1 个指针会导致 C 侧越界读。提供 4 个槽（同指针重复填充，packed RGBA 只用 dst[0]）。
-            this.audioPointerPtr = new PointerPointer<>(audioPointer, audioPointer, audioPointer, audioPointer);
+
+            //双声道，packet分布，提供两个同一个ptr
+            this.audioPointerPtr = new PointerPointer<>(audioPointer,audioPointer);
         }
 
         public void resetPosition() {audioBuffer.position(0).limit(capacity);
@@ -111,7 +109,6 @@ public class FrameBufferPoolWithQueue {
     private final BlockingQueue<ImageBufferSlot> imageReadyQueue;
 
     private final BlockingQueue<AudioBufferSlot> audioFreePool;
-    private AudioBufferSlot tmpAudioSlot;
 
     private final BlockingQueue<AudioBufferSlot> audioReadyQueue;
 
@@ -122,6 +119,7 @@ public class FrameBufferPoolWithQueue {
     public final int imageBufferCount;
     public final int audioBufferCount;
     public boolean audioEND = false;
+    private volatile QueueState state = QueueState.READY;
 
     /**
      * @param imageBufferCount   视频帧预分配槽总数（建议 2~3，即双/三缓冲流水线）
@@ -138,19 +136,14 @@ public class FrameBufferPoolWithQueue {
         this.audioBufferCount = audioBufferCount;
         this.imageFreePool = new LinkedBlockingQueue<>(imageBufferCount);
         this.imageReadyQueue = new LinkedBlockingQueue<>(imageBufferCount);
-        this.poolSeq = POOL_SEQ.incrementAndGet();
-        // 预分配全部槽，之后生命周期内零 new
         for (int i = 0; i < imageBufferCount; i++) {
             this.imageFreePool.offer(new ImageBufferSlot(this.imageDataCapacity));
         }
         if(audioCodecContext != null) {
-            // ★ 每帧一槽：swr_convert 单帧输出（AAC 1024 样本≈8KB、MP3 1152≈4.6KB）
-            //   给 16384 裕量，一帧放得下；MC read() 拿到 8~16KB 一帧即可上传播放。
+            //单个块大小，除非是flac那种超级大块（65535），正常AAC也就1100多。S16 双声道（2*2Byte）
             this.audioDataCapacity = 16384 * 4;
             this.audioFreePool = new LinkedBlockingQueue<>(audioBufferCount);
             this.audioReadyQueue = new LinkedBlockingQueue<>(audioBufferCount);
-            // ★ 修复：for 末尾不能有分号！旧代码 `for(...);{...}` 循环体为空、块只执行一次，
-            //   导致 audioBufferCount 个槽实际只预分配 1 个 → ready 恒 1、startAudio 预滚永远不足。
             for (int i = 0; i < audioBufferCount; i++) {
                 this.audioFreePool.offer(new AudioBufferSlot(this.audioDataCapacity));
             }
@@ -169,27 +162,27 @@ public class FrameBufferPoolWithQueue {
         slot.resetPosition();
         return slot;
     }
-    /** 借出一个空闲槽：按需选起始档，本档空则向上借大档，全部空则阻塞等待。 */
+    /** 借出一个空闲槽：空则阻塞等待。 */
     public AudioBufferSlot borrowAudioBuffer(int size) throws InterruptedException {
         AudioBufferSlot slot = audioFreePool.take();
         slot.resetPosition();
         return slot;
     }
 
-    /** 非阻塞借出音频槽：按需选起始档向上找，全空返回 null（调用方据此让出）。 */
+    /** 非阻塞借出音频槽：无空闲返回 null。 */
     public AudioBufferSlot tryBorrowAudioBuffer() {
-        if (this.tmpAudioSlot != null) return this.tmpAudioSlot;
+        if (this.state == QueueState.FROZEN) return null;
         AudioBufferSlot slot = audioFreePool.poll();
         if (slot != null) {
             slot.resetPosition();
             slot.audioBuffer.clear();
-            this.tmpAudioSlot = slot;
         }
         return slot;
     }
 
     /** 非阻塞借出；无空闲返回 null。 */
     public ImageBufferSlot tryBorrowImageBuffer() {
+        if (this.state == QueueState.FROZEN) return null;
         ImageBufferSlot slot = imageFreePool.poll();
         if (slot != null) slot.resetPosition();
         return slot;
@@ -197,48 +190,46 @@ public class FrameBufferPoolWithQueue {
 
     /** 解码完成，发布到就绪队列；队列满则背压阻塞（自动限流）。 */
     public void publishImageBuffer(ImageBufferSlot slot) throws InterruptedException {
+        if (this.state == QueueState.FROZEN) releaseImageBuffer(slot);
         imageReadyQueue.put(slot);
     }
     public void publishAudioBuffer(AudioBufferSlot slot) throws InterruptedException {
-        if (slot != null){
-            ByteBuffer byteBuffer = slot.audioBuffer;
-            int pos = byteBuffer.position();
-            if (pos > 0){
-                byteBuffer.flip();               // position=0, limit=pos（有效字节）
-                this.tmpAudioSlot = null;        // 每帧一槽：立即清累积
-                audioReadyQueue.put(slot);       // ★ 有数据即发布，不等满（MC read 立刻能取）
-            }else {
-                this.tmpAudioSlot = null;        // 空槽退池，不发布
-                releaseAudioBuffer(slot);
-            }
+        if (this.state == QueueState.FROZEN) releaseAudioBuffer(slot);
+        ByteBuffer byteBuffer = slot.audioBuffer;
+        int pos = byteBuffer.position();
+        if (pos > 0){
+            byteBuffer.flip();               // position=0, limit=pos（有效字节）
+            audioReadyQueue.put(slot);       // ★ 有数据即发布，不等满（MC read 立刻能取）
         }else {
-            if (this.tmpAudioSlot != null){
-                AudioBufferSlot s = this.tmpAudioSlot;
-                this.tmpAudioSlot = null;
-                publishAudioBuffer(s);           // EOF 尾部有数据则发布
-            }
+            releaseAudioBuffer(slot);
         }
+
     }
     // ==================== 渲染线程（消费者） ====================
 
     /** 获取一张已解码待上传的帧；无帧时阻塞等待解码线程。 */
     public ImageBufferSlot acquireImage() throws InterruptedException {
+        if (this.state == QueueState.FROZEN) return null;
         return imageReadyQueue.take();
     }
     public AudioBufferSlot acquireAudio() throws InterruptedException {
+        if (this.state == QueueState.FROZEN) return null;
         return audioReadyQueue.take();
     }
     /** 非阻塞获取；无就绪帧返回 null。 */
     public ImageBufferSlot tryAcquireImageBuffer() {
+        if (this.state == QueueState.FROZEN) return null;
         return imageReadyQueue.poll();
     }
 
     /** 非破坏性查看队头就绪帧（PTS 门控用，不弹出）。 */
     public ImageBufferSlot peekImageBuffer() {
+        if (this.state == QueueState.FROZEN) return null;
         return imageReadyQueue.peek();
     }
 
     public AudioBufferSlot tryAcquireAudioBuffer() {
+        if (this.state == QueueState.FROZEN) return null;
         return audioReadyQueue.poll();
     }
 
@@ -290,9 +281,42 @@ public class FrameBufferPoolWithQueue {
         return imageFreePool.size();
     }
 
+    /**
+     * [MEMPROBE] 解码后区域当前活跃字节（已离开 free 池、处于解码中或就绪队列的槽字节）。
+     * 用「free 池剩余容量」反推活跃槽数，无需额外状态。
+     */
+    public long getPostDecodeBytes() {
+        long bytes = (long) imageFreePool.remainingCapacity() * imageDataCapacity;
+        if (audioFreePool != null) {
+            bytes += (long) audioFreePool.remainingCapacity() * audioDataCapacity;
+        }
+        return bytes;
+    }
+
     /** 音频空闲池当前槽数（drainAudioBuffer 是否因无空闲槽而卡住的判定用）。 */
     public int getAudioFreeCount() {
         return audioFreePool != null ? audioFreePool.size() : 0;
+    }
+    public void Frozen(){this.state = QueueState.FROZEN;}
+    public boolean isRecycle(){return this.state == QueueState.RECYCLE;}
+    public void readyForFrozen(){this.state = QueueState.FROZEN;}
+    public void waitForFrozen(){
+        while (true){
+            if (this.state == QueueState.FROZEN){VideoInMinecraft.LOGGER.debug("frozen");RecycleAll();break;}
+        }
+    }
+    /**WARNING:该方法非线程安全！使用时必须和消费端在同一线程！**/
+    private void RecycleAll(){
+        if (this.state == QueueState.FROZEN) {
+            VideoInMinecraft.LOGGER.debug("pool recyle");
+            for (ImageBufferSlot slot : imageReadyQueue) {
+                releaseImageBuffer(slot);
+            }
+            for (AudioBufferSlot slot : audioReadyQueue) {
+                releaseAudioBuffer(slot);
+            }
+        }
+        this.state = QueueState.READY;
     }
 
     /** 释放所有槽的对齐内存（nmemAlignedAlloc 的成对释放）。 */
